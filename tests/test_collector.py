@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 
@@ -33,6 +34,7 @@ async def _wait(client: httpx.AsyncClient, api: str, task_id: str, states: set[s
 @pytest.fixture
 async def stack(tmp_path):
     source_state.revisions.clear()
+    source_state.payload_kb.clear()
     source_state.delay_seconds = 0.0
     source_state.chunk_delay_seconds = 0.0
     source_state.failing.clear()
@@ -458,3 +460,286 @@ async def test_pause_before_late_response_arrives_cannot_progress(stack):
     assert done["state"] == "completed", done
     package = await client.get(f"{api}/tasks/{task_id}/package")
     assert hashlib.sha256(package.content).hexdigest() == done["verified_sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Download/refresh race: an accepted download must deliver the package it
+# selected, no matter how a concurrent refresh ends; superseded packages must
+# be released once no download holds them.
+# ---------------------------------------------------------------------------
+
+async def _collect_completed(client: httpx.AsyncClient, api: str, task_id: str) -> dict:
+    await client.post(f"{api}/tasks/{task_id}/start")
+    view = await _wait(client, api, task_id, {"completed", "failed"}, timeout=120)
+    assert view["state"] == "completed", view
+    return view
+
+
+async def _wait_file_gone(path, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while path.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert not path.exists(), f"{path} was not released"
+
+
+async def test_download_in_flight_survives_successful_refresh(stack):
+    st, client, settings, collector = stack
+    source, api = st.source_url, st.api_url
+    station, date = "RACE", "2026-11-12"
+    # 16 MiB: larger than any socket/transport buffer, so the response is
+    # still streaming (lease held) when the refresh completes.
+    await client.post(
+        f"{source}/admin/size",
+        json={"station": station, "date": date, "payload_kb": 16 * 1024},
+    )
+    task_id = (
+        await client.post(f"{api}/tasks", json={"station": station, "date": date})
+    ).json()["id"]
+    first = await _collect_completed(client, api, task_id)
+    old_sha, old_size = first["verified_sha256"], first["verified_size"]
+    old_file = settings.packages_dir / f"{station}-{date}-{old_sha[:12]}.tar.gz"
+    assert old_file.exists()
+
+    async with client.stream("GET", f"{api}/tasks/{task_id}/package") as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-length"] == str(old_size)
+        assert resp.headers["digest"] == f"sha-256={old_sha}"
+        chunks = resp.aiter_bytes(64 * 1024)
+        head = await chunks.__anext__()
+        assert len(head) == 64 * 1024
+
+        # While this download is in flight, the source moves and a refresh
+        # replaces the package.
+        await client.post(
+            f"{source}/admin/revision",
+            json={"station": station, "date": date, "revision": "v2"},
+        )
+        await client.post(f"{api}/tasks/{task_id}/refresh")
+        # A new download requested mid-refresh still obeys the task state.
+        mid = await client.get(f"{api}/tasks/{task_id}/package")
+        assert mid.status_code == 409
+        done = await _wait(client, api, task_id, {"completed", "failed"}, timeout=120)
+        assert done["state"] == "completed", done
+        assert done["verified_sha256"] != old_sha
+
+        # The refresh finished, yet the old file must NOT have been deleted
+        # under the accepted download: its lease defers the deletion.
+        assert old_file.exists(), "old package deleted while a download held it"
+        assert collector.packages.pinned().get(str(old_file), 0) >= 1
+
+        # A download accepted after the refresh serves the NEW package.
+        new_pkg = await client.get(f"{api}/tasks/{task_id}/package")
+        assert new_pkg.status_code == 200
+        assert hashlib.sha256(new_pkg.content).hexdigest() == done["verified_sha256"]
+
+        # Finish the in-flight download: it must deliver the ORIGINAL package,
+        # exactly matching the length and digest promised in its headers.
+        hasher = hashlib.sha256(head)
+        total = len(head)
+        async for chunk in chunks:
+            hasher.update(chunk)
+            total += len(chunk)
+    assert total == old_size, (total, old_size)
+    assert hasher.hexdigest() == old_sha
+
+    # The last lease is gone: the deferred deletion of the old package runs.
+    await _wait_file_gone(old_file)
+    assert not collector.packages.pinned()
+    remaining = list(settings.packages_dir.glob("*.tar.gz"))
+    assert len(remaining) == 1
+    assert remaining[0].name.endswith(f"{done['verified_sha256'][:12]}.tar.gz")
+
+
+async def test_download_in_flight_survives_failed_refresh(stack):
+    st, client, settings, collector = stack
+    source, api = st.source_url, st.api_url
+    station, date = "RACEF", "2026-11-13"
+    await client.post(
+        f"{source}/admin/size",
+        json={"station": station, "date": date, "payload_kb": 4 * 1024},
+    )
+    task_id = (
+        await client.post(f"{api}/tasks", json={"station": station, "date": date})
+    ).json()["id"]
+    first = await _collect_completed(client, api, task_id)
+    old_sha, old_size = first["verified_sha256"], first["verified_size"]
+    old_file = settings.packages_dir / f"{station}-{date}-{old_sha[:12]}.tar.gz"
+    assert old_file.exists()
+
+    async with client.stream("GET", f"{api}/tasks/{task_id}/package") as resp:
+        assert resp.status_code == 200
+        chunks = resp.aiter_bytes(64 * 1024)
+        head = await chunks.__anext__()
+
+        # The source publishes v2 but serves corrupt bytes for it: the refresh
+        # fails terminally and retires the old package, yet this accepted
+        # download must still complete intact.
+        await client.post(
+            f"{source}/admin/revision",
+            json={"station": station, "date": date, "revision": "v2"},
+        )
+        await client.post(
+            f"{source}/admin/fault",
+            json={"station": station, "date": date, "mode": "corrupt"},
+        )
+        await client.post(f"{api}/tasks/{task_id}/refresh")
+        done = await _wait(client, api, task_id, {"failed"}, timeout=120)
+        assert done["state"] == "failed", done
+
+        hasher = hashlib.sha256(head)
+        total = len(head)
+        async for chunk in chunks:
+            hasher.update(chunk)
+            total += len(chunk)
+    assert total == old_size, (total, old_size)
+    assert hasher.hexdigest() == old_sha
+
+    # The failed refresh retired the old package; after the download ended the
+    # file is gone and new downloads are refused (task is failed).
+    await _wait_file_gone(old_file)
+    refused = await client.get(f"{api}/tasks/{task_id}/package")
+    assert refused.status_code == 409
+
+
+async def test_interleaved_downloads_and_disconnect_release_old_package(stack):
+    st, client, settings, collector = stack
+    source, api = st.source_url, st.api_url
+    station, date = "RACEX", "2026-11-14"
+    await client.post(
+        f"{source}/admin/size",
+        json={"station": station, "date": date, "payload_kb": 16 * 1024},
+    )
+    task_id = (
+        await client.post(f"{api}/tasks", json={"station": station, "date": date})
+    ).json()["id"]
+    first = await _collect_completed(client, api, task_id)
+    old_sha, old_size = first["verified_sha256"], first["verified_size"]
+    old_file = settings.packages_dir / f"{station}-{date}-{old_sha[:12]}.tar.gz"
+
+    url = f"{api}/tasks/{task_id}/package"
+    dl1 = client.stream("GET", url)
+    dl2 = client.stream("GET", url)
+    resp1 = await dl1.__aenter__()
+    resp2 = await dl2.__aenter__()
+    try:
+        assert resp1.status_code == 200 and resp2.status_code == 200
+        it1 = resp1.aiter_bytes(64 * 1024)
+        it2 = resp2.aiter_bytes(64 * 1024)
+        head1 = await it1.__anext__()
+        head2 = await it2.__anext__()
+        assert len(head1) == len(head2) == 64 * 1024
+
+        # Refresh to v2 while both downloads are in flight.
+        await client.post(
+            f"{source}/admin/revision",
+            json={"station": station, "date": date, "revision": "v2"},
+        )
+        await client.post(f"{api}/tasks/{task_id}/refresh")
+        done = await _wait(client, api, task_id, {"completed", "failed"}, timeout=120)
+        assert done["state"] == "completed", done
+
+        # Two leases pin the old package.
+        assert old_file.exists()
+        assert collector.packages.pinned().get(str(old_file)) == 2
+
+        # Client 1 disconnects mid-stream: one lease remains, the file stays.
+        await dl1.__aexit__(None, None, None)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if collector.packages.pinned().get(str(old_file), 0) <= 1:
+                break
+            await asyncio.sleep(0.05)
+        assert collector.packages.pinned().get(str(old_file), 0) == 1
+        assert old_file.exists(), "old package deleted while a download still held it"
+
+        # Client 2 reads to the end: full original body, then the deferred
+        # deletion finally runs.
+        hasher = hashlib.sha256(head2)
+        total = len(head2)
+        async for chunk in it2:
+            hasher.update(chunk)
+            total += len(chunk)
+        assert total == old_size
+        assert hasher.hexdigest() == old_sha
+    finally:
+        await dl1.__aexit__(None, None, None)
+        await dl2.__aexit__(None, None, None)
+
+    await _wait_file_gone(old_file)
+    assert not collector.packages.pinned()
+
+
+async def test_package_response_streams_even_if_file_vanishes(stack):
+    """Defense in depth: the response serves an already-open descriptor.
+
+    Deletes the package file in the exact window where the old implementation
+    broke (right after the 200 status line went out) by driving the real ASGI
+    app with a hooked ``send``.
+    """
+    st, client, settings, collector = stack
+    api = st.api_url
+    station, date = "GONE", "2026-11-15"
+    task_id = (
+        await client.post(f"{api}/tasks", json={"station": station, "date": date})
+    ).json()["id"]
+    done = await _collect_completed(client, api, task_id)
+    sha, size = done["verified_sha256"], done["verified_size"]
+    (pkg,) = list(settings.packages_dir.glob("*.tar.gz"))
+
+    direct_app = create_app(settings, collector)
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+        if message["type"] == "http.response.start":
+            pkg.unlink()  # vanish right after the 200 was sent
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": f"/tasks/{task_id}/package",
+        "raw_path": f"/tasks/{task_id}/package".encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 80),
+    }
+    await direct_app(scope, receive, send)
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    assert start["status"] == 200
+    body = b"".join(
+        m.get("body", b"") for m in messages if m["type"] == "http.response.body"
+    )
+    assert len(body) == size
+    assert hashlib.sha256(body).hexdigest() == sha
+
+
+async def test_startup_sweeps_orphan_packages(stack):
+    st, client, settings, collector = stack
+    api = st.api_url
+    task_id = (
+        await client.post(f"{api}/tasks", json={"station": "SWEEP", "date": "2026-11-16"})
+    ).json()["id"]
+    await _collect_completed(client, api, task_id)
+    (current,) = list(settings.packages_dir.glob("*.tar.gz"))
+    orphan = settings.packages_dir / "ORPH-2020-01-01-deadbeefdead.tar.gz"
+    orphan.write_bytes(b"stale")
+    temp = settings.packages_dir / ".publish-abandoned"
+    temp.write_bytes(b"half")
+
+    # A fresh collector over the same data dir sweeps orphans at startup.
+    fresh = Collector(settings)
+    await fresh.startup()
+    try:
+        assert current.exists(), "referenced package must survive the sweep"
+        assert not orphan.exists(), "unreferenced package must be swept"
+        assert not temp.exists(), "abandoned publish temp must be swept"
+    finally:
+        await fresh.shutdown()

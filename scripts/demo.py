@@ -5,7 +5,9 @@ Usage:
     python scripts/demo.py [--source http://localhost:9000] [--api http://localhost:8000]
 
 The demo collects one archive, pauses/resumes it, switches the source revision,
-refreshes and verifies the downloadable package's size and SHA-256.
+refreshes and verifies the downloadable package's size and SHA-256 — and finally
+keeps a slow download open while another refresh replaces the package, showing
+that the accepted download still receives the original bytes intact.
 """
 
 from __future__ import annotations
@@ -96,6 +98,63 @@ def main() -> int:
         package2.raise_for_status()
         assert hashlib.sha256(package2.content).hexdigest() == done2["verified_sha256"]
         print("revision switch verified:", done2["source_revision"], done2["verified_sha256"][:12])
+
+        # --- download/refresh interleave -----------------------------------
+        # Publish a bigger v3 and refresh onto it, then keep a slow download of
+        # v3 open while a second refresh replaces it with v4.  The accepted
+        # download must still deliver the exact v3 bytes it promised.
+        print("\n== download/refresh interleave ==")
+        client.post(
+            f"{source}/admin/size",
+            json={"station": args.station, "date": args.date, "payload_kb": 12 * 1024},
+        )
+        client.post(
+            f"{source}/admin/revision",
+            json={"station": args.station, "date": args.date, "revision": "v3"},
+        )
+        client.post(f"{api}/tasks/{task_id}/refresh")
+        done3 = wait(client, api, task_id, {"completed", "failed"}, timeout=120)
+        assert done3["state"] == "completed", done3
+        print(f"on v3 now: {done3['verified_size']} bytes, sha256 {done3['verified_sha256'][:12]}…")
+
+        with client.stream("GET", f"{api}/tasks/{task_id}/package") as resp:
+            resp.raise_for_status()
+            promised = resp.headers["digest"].removeprefix("sha-256=")
+            assert promised == done3["verified_sha256"]
+            chunks = resp.iter_bytes(64 * 1024)
+            first = next(chunks)
+            print(f"download accepted (200, digest {promised[:12]}…); reading slowly…")
+
+            # Another request refreshes to v4 while this download is in flight.
+            client.post(
+                f"{source}/admin/revision",
+                json={"station": args.station, "date": args.date, "revision": "v4"},
+            )
+            client.post(f"{api}/tasks/{task_id}/refresh")
+            done4 = wait(client, api, task_id, {"completed", "failed"}, timeout=120)
+            assert done4["state"] == "completed", done4
+            assert done4["verified_sha256"] != done3["verified_sha256"]
+            print(f"refresh finished mid-download: task is on {done4['source_revision']} "
+                  f"(sha256 {done4['verified_sha256'][:12]}…); the old download continues")
+
+            hasher = hashlib.sha256(first)
+            total = len(first)
+            for chunk in chunks:
+                hasher.update(chunk)
+                total += len(chunk)
+                time.sleep(0.02)  # slow consumer: keep the stream open
+
+        assert total == done3["verified_size"], (total, done3["verified_size"])
+        assert hasher.hexdigest() == done3["verified_sha256"]
+        print(f"in-flight download completed intact: {total} bytes, "
+              f"sha256 still {hasher.hexdigest()[:12]}… (the v3 it selected)")
+
+        fresh = client.get(f"{api}/tasks/{task_id}/package")
+        fresh.raise_for_status()
+        assert hashlib.sha256(fresh.content).hexdigest() == done4["verified_sha256"]
+        print(f"a fresh download now serves {done4['source_revision']} "
+              f"(sha256 {done4['verified_sha256'][:12]}…); the old package was released")
+
         print("events:", [e["event"] for e in client.get(f"{api}/tasks/{task_id}/events").json()])
     return 0
 

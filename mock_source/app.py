@@ -31,6 +31,7 @@ STREAM_CHUNK = 32 * 1024
 @dataclass
 class SourceState:
     revisions: dict[tuple[str, str], str] = field(default_factory=dict)
+    payload_kb: dict[tuple[str, str], int] = field(default_factory=dict)
     delay_seconds: float = 0.0
     chunk_delay_seconds: float = 0.0
     failing: set[tuple[str, str]] = field(default_factory=set)
@@ -52,6 +53,9 @@ class SourceState:
 
     def revision(self, station: str, date: str) -> str:
         return self.revisions.get((station, date), "v1")
+
+    def payload(self, station: str, date: str) -> int:
+        return self.payload_kb.get((station, date), 1024)
 
 
 state = SourceState()
@@ -90,6 +94,26 @@ class DelayRequest(BaseModel):
     chunk_seconds: float = Field(0, ge=0, le=5, description="Delay between body chunks")
 
 
+class SizeRequest(BaseModel):
+    station: str
+    date: str
+    payload_kb: int = Field(..., ge=1, le=262144, description="Random payload size in KiB")
+
+    @field_validator("station")
+    @classmethod
+    def valid_station(cls, value: str) -> str:
+        if not STATION_RE.fullmatch(value):
+            raise ValueError("station must match [A-Za-z0-9_-]{1,32}")
+        return value
+
+    @field_validator("date")
+    @classmethod
+    def valid_date(cls, value: str) -> str:
+        if not DATE_RE.fullmatch(value):
+            raise ValueError("date must be YYYY-MM-DD")
+        return value
+
+
 class FaultRequest(BaseModel):
     station: str
     date: str
@@ -117,15 +141,15 @@ def _validate(station: str, date: str) -> None:
 
 
 @lru_cache(maxsize=64)
-def build_package(station: str, date: str, revision: str) -> bytes:
-    """Build a deterministic tar.gz for (station, date, revision).
+def build_package(station: str, date: str, revision: str, payload_kb: int = 1024) -> bytes:
+    """Build a deterministic tar.gz for (station, date, revision, payload_kb).
 
     The payload is mostly incompressible so progress and Range behaviour are
     observable, and switching revisions changes both bytes and digest.
     """
-    seed = hashlib.sha256(f"{station}|{date}|{revision}".encode()).digest()
+    seed = hashlib.sha256(f"{station}|{date}|{revision}|{payload_kb}".encode()).digest()
     rng = random.Random(seed)
-    blob = rng.randbytes(1024 * 1024)
+    blob = rng.randbytes(payload_kb * 1024)
     rows = [
         "station,date,time,temperature_c,pressure_hpa,wind_mps",
         *[
@@ -156,7 +180,7 @@ def build_package(station: str, date: str, revision: str) -> bytes:
 
 def _meta(station: str, date: str) -> dict:
     revision = state.revision(station, date)
-    body = build_package(station, date, revision)
+    body = build_package(station, date, revision, state.payload(station, date))
     digest = hashlib.sha256(body).hexdigest()
     return {
         "name": f"{station}-{date}.tar.gz",
@@ -233,7 +257,7 @@ async def package(
     if (station, date) in state.failing:
         raise HTTPException(503, "simulated source outage")
     entry = _meta(station, date)
-    body = build_package(station, date, entry["revision"])
+    body = build_package(station, date, entry["revision"], state.payload(station, date))
     etag = entry["etag"]
     if (station, date) in state.corrupting:
         # Advertise the honest digest but serve a body with a flipped byte.
@@ -302,6 +326,10 @@ async def admin_state() -> dict:
             {"station": station, "date": date, "revision": revision}
             for (station, date), revision in sorted(state.revisions.items())
         ],
+        "payload_kb": [
+            {"station": station, "date": date, "payload_kb": kb}
+            for (station, date), kb in sorted(state.payload_kb.items())
+        ],
         "failing": sorted(f"{s}/{d}" for s, d in state.failing),
         "corrupting": sorted(f"{s}/{d}" for s, d in state.corrupting),
         "no_range": sorted(f"{s}/{d}" for s, d in state.no_range),
@@ -315,6 +343,12 @@ async def admin_state() -> dict:
 async def set_revision(body: RevisionRequest) -> dict:
     state.revisions[(body.station, body.date)] = body.revision
     return {"station": body.station, "date": body.date, "revision": body.revision, "entry": _meta(body.station, body.date)}
+
+
+@app.post("/admin/size")
+async def set_size(body: SizeRequest) -> dict:
+    state.payload_kb[(body.station, body.date)] = body.payload_kb
+    return {"station": body.station, "date": body.date, "payload_kb": body.payload_kb}
 
 
 @app.post("/admin/fault")
@@ -342,6 +376,7 @@ async def set_delay(body: DelayRequest) -> dict:
 @app.post("/admin/reset")
 async def reset() -> dict:
     state.revisions.clear()
+    state.payload_kb.clear()
     state.delay_seconds = 0.0
     state.chunk_delay_seconds = 0.0
     state.failing.clear()

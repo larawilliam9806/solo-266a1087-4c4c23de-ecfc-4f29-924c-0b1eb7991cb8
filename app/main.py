@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
 
 from . import __version__
 from .collector import Collector
 from .config import Settings
 from .models import ErrorResponse, StartTaskRequest, TaskState, TaskView
+from .packages import LeasedPackageResponse, PackageRetired
 from .store import utcnow
 
 
@@ -180,23 +181,46 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
     async def download_package(task_id: str):
+        """Serve the verified package selected *now*.
+
+        The lease is acquired and the file opened before the 200 is sent, so
+        a concurrent refresh — successful or not — can never truncate this
+        download: the old file's deletion is deferred until streaming ends.
+        """
         row = row_or_404(task_id)
-        if row["state"] != "completed":
-            raise HTTPException(409, detail=f"task is {row['state']}; no package available")
-        if not package_ready(row):
-            raise HTTPException(409, detail="package missing or failed verification")
-        if not Path(row["package_path"]).is_file():
-            raise HTTPException(409, detail="package file is gone; refresh the task")
-        filename = f"{row['station']}-{row['date']}.tar.gz"
-        return FileResponse(
-            row["package_path"],
-            media_type="application/gzip",
-            filename=filename,
-            headers={
-                "Digest": f"sha-256={row['verified_sha256']}",
-                "ETag": f'"{row["verified_sha256"]}"',
-            },
-        )
+        for _ in range(3):
+            if row["state"] != "completed":
+                raise HTTPException(409, detail=f"task is {row['state']}; no package available")
+            if not package_ready(row):
+                raise HTTPException(409, detail="package missing or failed verification")
+            path = row["package_path"]
+            try:
+                lease = collector.packages.acquire(path)
+            except PackageRetired:
+                # A refresh swapped the package between the row read and the
+                # lease; re-read and offer the current package instead.
+                row = row_or_404(task_id)
+                continue
+            try:
+                handle = open(path, "rb")  # noqa: SIM115 - closed by the response
+            except OSError:
+                lease.release()
+                row = row_or_404(task_id)
+                continue
+            size = os.fstat(handle.fileno()).st_size
+            if row["verified_size"] is not None and size != row["verified_size"]:
+                handle.close()
+                lease.release()
+                raise HTTPException(409, detail="package on disk does not match verified size")
+            filename = f"{row['station']}-{row['date']}.tar.gz"
+            return LeasedPackageResponse(
+                handle=handle,
+                size=size,
+                lease=lease,
+                filename=filename,
+                sha256=row["verified_sha256"],
+            )
+        raise HTTPException(409, detail="package is being replaced; retry the download")
 
     @app.get("/")
     async def index(request: Request):

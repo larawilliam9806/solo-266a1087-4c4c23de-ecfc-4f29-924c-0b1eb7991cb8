@@ -25,11 +25,17 @@ Docker is not required for the tests; they start both ASGI apps on loopback
 ports in-process.
 
 A scripted end-to-end demonstration (collect → pause → resume → revision switch
-→ verified download):
+→ verified download → download/refresh interleave):
 
 ```bash
 python scripts/demo.py
 ```
+
+The last section keeps a slow package download open while another request
+switches the source revision and refreshes: the in-flight download still
+receives the complete original package (length and SHA-256 as promised in its
+headers), downloads accepted afterwards get the new package, and the
+superseded package file is deleted once the last old download finishes.
 
 Local (non-Docker) run:
 
@@ -56,7 +62,7 @@ the current task.
 | `POST /tasks/{id}/refresh` | Re-read the directory for a completed task and re-collect if it moved |
 | `GET /tasks`, `GET /tasks/{id}` | List / inspect tasks (state, bytes, percent, expected vs verified size & SHA-256, error) |
 | `GET /tasks/{id}/events` | Append-only event log for the task |
-| `GET /tasks/{id}/package` | Download the archive; `409` unless completed and verified |
+| `GET /tasks/{id}/package` | Download the archive; `409` unless completed and verified. Once accepted (200), the download delivers the full package it selected even if a refresh replaces or removes it mid-stream |
 
 `GET /tasks` accepts `?state=running|paused|completed|failed|queued`.
 
@@ -93,6 +99,16 @@ the current task.
    (timeouts, 5xx, network) keep their partial prefix and can be retried via
    `start`; terminal failures (bad metadata, repeated verification/source
    mismatch) delete partial data.
+8. **An accepted download is immortal; a replaced package is not.** Every
+   package download leases the exact file it selected and opens the file
+   descriptor *before* the 200 is sent, so the body, `Content-Length` and
+   `Digest` always describe the same inode. Package deletions (refresh
+   replacing a package, terminal failure dropping a stale one, startup
+   sweeping orphans) go through a lease registry: a file no download holds is
+   deleted immediately, a leased file is deleted the moment its last download
+   finishes or disconnects. Refresh never waits for slow downloads, new
+   downloads still get `409` unless the task is completed and verified, and
+   the current package and resumable part files are never deleted.
 
 ## Source mock controls
 
@@ -105,6 +121,11 @@ curl -X POST localhost:9000/admin/revision \
 # add 300 ms header delay and 10 ms per-chunk delay
 curl -X POST localhost:9000/admin/delay \
   -H 'content-type: application/json' -d '{"seconds":0.3,"chunk_seconds":0.01}'
+
+# grow the random payload to 12 MiB (useful to watch downloads/refresh overlap)
+curl -X POST localhost:9000/admin/size \
+  -H 'content-type: application/json' \
+  -d '{"station":"54511","date":"2026-11-17","payload_kb":12288}'
 
 # simulate outage (503) or a corrupted body (honest digest, tampered bytes)
 curl -X POST localhost:9000/admin/fault \
@@ -126,4 +147,9 @@ covers: full verified flow, duplicate task creation, pause with a late response
 resume, revision change mid-pause (old bytes discarded), corruption → failure
 with no downloadable package, outage → failure with reason → successful retry, refresh replacing a package on
 revision change, a source that ignores Range (clean restart, no append), a pause
-issued before a delayed response arrives, and input validation.
+issued before a delayed response arrives, input validation — and the
+download/refresh race: an in-flight download survives a successful refresh, a
+terminally failing refresh, interleaved downloads ending out of order and
+client disconnects (old package released exactly when the last lease ends),
+the package file vanishing right after the 200 (descriptor already open), the
+lease registry itself, and the startup sweep of orphaned packages.

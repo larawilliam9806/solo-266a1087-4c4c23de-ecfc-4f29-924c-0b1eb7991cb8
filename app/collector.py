@@ -32,6 +32,7 @@ import httpx
 
 from .config import Settings
 from .models import CatalogEntry
+from .packages import PackageRegistry
 from .store import Store, utcnow
 
 log = logging.getLogger("collector.worker")
@@ -71,6 +72,10 @@ class Collector:
         self.store = Store(settings.database_path)
         settings.parts_dir.mkdir(parents=True, exist_ok=True)
         settings.packages_dir.mkdir(parents=True, exist_ok=True)
+        # Lease registry: in-flight downloads pin their package file; every
+        # package deletion below goes through it so a refresh can never pull
+        # a file out from under an accepted download.
+        self.packages = PackageRegistry()
         self._runs: dict[str, RunningTask] = {}
         self._tasks: set[asyncio.Task] = set()
         self._client: httpx.AsyncClient | None = http_client
@@ -86,6 +91,7 @@ class Collector:
             )
         interrupted = [row["id"] for row in self.store.list("running")]
         self._recover_interrupted()
+        self._sweep_orphan_packages()
         if self.settings.auto_resume:
             # Only tasks that were mid-transfer when the process died (plus queued
             # work) resume automatically; an operator's explicit pause is respected.
@@ -123,6 +129,25 @@ class Collector:
                 error="interrupted by process restart; resumable",
             )
             self.store.event(row["id"], "interrupted", "resumable after restart")
+
+    def _sweep_orphan_packages(self) -> None:
+        """Delete package files no task references (e.g. replaced before a crash).
+
+        Runs at startup before any worker or download exists, so the registry
+        holds no leases and every deletion is immediate.  Packages still
+        referenced by a task row (any state) and resumable part files are
+        never touched.
+        """
+        referenced = {
+            row["package_path"] for row in self.store.list() if row["package_path"]
+        }
+        for path in sorted(self.settings.packages_dir.iterdir()):
+            if not path.is_file():
+                continue
+            if path.name.startswith(".publish-"):
+                self.packages.retire(str(path))  # leftover temp from a crashed publish
+            elif path.name.endswith(".tar.gz") and str(path) not in referenced:
+                self.packages.retire(str(path))
 
     # -- public operations ----------------------------------------------
     def create_task(self, task_id: str, station: str, date: str) -> None:
@@ -306,10 +331,12 @@ class Collector:
         if moved:
             if not retryable:
                 # Terminal failure: no half package and nothing that could be
-                # mistaken for resumable data.
+                # mistaken for resumable data.  The stale package is retired
+                # through the registry: an in-flight download keeps streaming
+                # it and the file is deleted when the last download ends.
                 self._discard_parts(run.task_id)
                 if stale_package:
-                    stale_package.unlink(missing_ok=True)
+                    self.packages.retire(str(stale_package))
             self.store.event(
                 run.task_id,
                 "failed",
@@ -615,15 +642,20 @@ class Collector:
         if not moved:
             # A pause (or a newer generation) won the race: remove the artifact
             # and keep the part file so the task is never falsely completed and
-            # never exposes an unverified/half package.
-            final.unlink(missing_ok=True)
+            # never exposes an unverified/half package.  Retire (not unlink):
+            # the path may be leased by a download of the identical package.
+            self.packages.retire(str(final))
             raise Interrupted()
 
         if part != final:
             part.unlink(missing_ok=True)
+        # Superseded packages for this station/date are retired, never unlinked
+        # outright: a download accepted before the refresh keeps its lease and
+        # receives the full old body; the old file is deleted as soon as the
+        # last such download finishes or disconnects.
         for old in self.settings.packages_dir.glob(f"{station}-{date}-*.tar.gz"):
             if old != final:
-                old.unlink(missing_ok=True)
+                self.packages.retire(str(old))
         self.store.event(run.task_id, "verified", f"sha256={entry.sha256} size={entry.size}")
 
     def _discard_parts(self, task_id: str, keep: Path | None = None) -> None:
